@@ -2,7 +2,7 @@
 //
 // 项序 / 分组不在这里定义 —— 唯一来源是 modules/menu-model.js(与悬浮球菜单共用),
 // 本文件只负责把模型画成原生菜单。加项/调顺序请改 menu-model.js。
-const { Tray, Menu, nativeImage } = require('electron');
+const { Tray, Menu, nativeImage, Notification } = require('electron');
 const path = require('path');
 const menuModel = require('./menu-model');
 
@@ -63,8 +63,20 @@ function create({ log, state, onMenuAction, getMenuContext, beforeMenu }) {
   }
 
   function createTray() {
-    const trayIcon = nativeImage.createFromPath(LOGO).resize({ width: 16, height: 16 });
-    state.tray = new Tray(trayIcon);
+    // Windows 托盘 16px(任务栏小图标);Linux 托盘(StatusNotifierItem)按面板高度缩放,
+    // 16px 在高 DPI 下会糊,用 22px —— 与 GNOME/KDE 图标网格的常用尺寸一致。
+    const iconSize = process.platform === 'win32' ? 16 : 22;
+    const trayIcon = nativeImage.createFromPath(LOGO).resize({ width: iconSize, height: iconSize });
+    try {
+      state.tray = new Tray(trayIcon);
+    } catch (e) {
+      // Linux 上托盘需要 StatusNotifierItem 支持:GNOME 默认无托盘区(需 AppIndicator 扩展),
+      // 纯 Wayland 无 XWayland 也可能构造失败。托盘失败不能拖垮应用 —— 记日志后照常启动,
+      // 只是少一个入口(主窗、悬浮球菜单都还在)。
+      log('[tray] 创建失败(缺少托盘宿主?):', e && e.message);
+      state.tray = null;
+      return;
+    }
     // 悬浮提示:只显示产品名(与窗口标题、快捷方式名统一为 DeepSeek)
     state.tray.setToolTip('DeepSeek');
 
@@ -79,6 +91,14 @@ function create({ log, state, onMenuAction, getMenuContext, beforeMenu }) {
     // 左键单击/双击:直接唤出主窗(原有行为,不改)。"隐藏"只在菜单首项里提供
     state.tray.on('click', () => onMenuAction('show-main'));
     state.tray.on('double-click', () => onMenuAction('show-main'));
+    // Linux 的 StatusNotifierItem 用 activate 表示单击(Wayland 下 click 事件不可靠)
+    if (process.platform !== 'win32') {
+      try {
+        state.tray.on('activate', () => onMenuAction('show-main'));
+      } catch (e) {
+        /* 该事件在旧版 Electron 上不存在的可能性,忽略 */
+      }
+    }
   }
 
   // 置顶等状态变化时主动刷新托盘菜单(不依赖 right-click 事件重建,保证勾选状态实时一致)
@@ -88,14 +108,28 @@ function create({ log, state, onMenuAction, getMenuContext, beforeMenu }) {
     }
   }
 
-  // 系统气泡提示(首次"关闭到托盘"、桌宠被隐藏时用;仅 Windows 支持,其他平台静默跳过)
+  // 系统提示(首次"关闭到托盘"、桌宠被隐藏时用)
+  //   Windows:Tray.displayBalloon(气泡,由托盘宿主绘制)
+  //   Linux/macOS:displayBalloon 不存在,改走标准 Notification(freedesktop 通知服务,
+  //   GNOME/KDE 都有);两者都不可用时静默跳过 —— 提示失败绝不能影响主流程
   function notify(title, content) {
-    if (process.platform !== 'win32') return;
-    if (!state.tray || state.tray.isDestroyed()) return;
+    if (process.platform === 'win32') {
+      if (!state.tray || state.tray.isDestroyed()) return;
+      try {
+        state.tray.displayBalloon({ title, content });
+      } catch (e) {
+        log('[tray] balloon failed:', e && e.message);
+      }
+      return;
+    }
     try {
-      state.tray.displayBalloon({ title, content });
+      if (!Notification.isSupported()) return;
+      const n = new Notification({ title, body: content, silent: true });
+      // 点击通知 → 唤出主窗(与气泡行为的直觉一致)
+      n.on('click', () => onMenuAction('show-main'));
+      n.show();
     } catch (e) {
-      log('[tray] balloon failed:', e && e.message);
+      log('[tray] notification failed:', e && e.message);
     }
   }
 

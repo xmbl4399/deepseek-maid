@@ -2,6 +2,7 @@
   "name": "deepseek-desktop",
   "version": "1.2.1",
   "main": "main.js",
+  "desktopName": "deepseek-desktop.desktop",
   "scripts": {
     "start": "electron .",
     "test": "node scripts/smoke-test.js && node scripts/require-check.js",
@@ -55,8 +56,46 @@
       "icon": "ui/logo.png"
     },
     "linux": {
-      "target": "AppImage",
-      "icon": "ui/logo.png"
+      "target": [
+        "deb",
+        "AppImage"
+      ],
+      "icon": "build/icons",
+      "executableName": "deepseek-desktop",
+      "syncDesktopName": true,
+      "category": "Network",
+      "synopsis": "DeepSeek 网页版桌面客户端",
+      "description": "DeepSeek 网页版桌面客户端(多标签 + 悬浮球/鲸鱼娘桌宠 + 框选截图提问)",
+      "maintainer": "xmbl4399 <m18735714399@gmail.com>",
+      "vendor": "xmbl4399",
+      "desktop": {
+        "entry": {
+          "Name": "DeepSeek",
+          "GenericName": "AI 助手",
+          "Categories": "Network;Utility;",
+          "Keywords": "deepseek;chat;ai;assistant;"
+        }
+      },
+      "artifactName": "DeepSeek-Desktop-${version}-${arch}.${ext}"
+    },
+    "deb": {
+      "packageName": "deepseek-desktop",
+      "priority": "optional",
+      "packageCategory": "net",
+      "depends": [
+        "libgtk-3-0",
+        "libnotify4",
+        "libnss3",
+        "libxss1",
+        "libxtst6",
+        "xdg-utils",
+        "libatspi2.0-0",
+        "libuuid1",
+        "libsecret-1-0"
+      ],
+      "recommends": [
+        "x11-utils"
+      ]
     }
   },
   "dependencies": {

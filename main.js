@@ -468,10 +468,16 @@ function hideMain() {
   if (state.mainWindow && !state.mainWindow.isDestroyed()) state.mainWindow.hide();
 }
 
-// 卸载 DeepSeek:定位 NSIS 卸载程序,二次确认后运行(仅打包版有意义)
+// 卸载 DeepSeek:Windows 走 NSIS 卸载器;Linux 走包管理器
 function uninstallApp() {
   if (!app.isPackaged) {
     dialog.showMessageBox({ type: 'info', message: '开发模式下不支持卸载' }).catch(() => {});
+    return;
+  }
+  // Linux 没有可执行的自卸载器:deb 归 dpkg/apt 管,AppImage 直接删文件。
+  // 这里给出**对应安装方式的具体命令**,而不是假装能自卸载。
+  if (process.platform === 'linux') {
+    uninstallLinux();
     return;
   }
   const exeDir = path.dirname(process.execPath);
@@ -509,18 +515,88 @@ function uninstallApp() {
     .catch(() => {});
 }
 
+// Linux 卸载引导:按实际安装形态给命令(不伪造"一键卸载"按钮 —— 那需要 root,弹 sudo 更糟)
+function uninstallLinux() {
+  const isAppImage = !!(process.env.APPIMAGE && process.env.APPIMAGE.length);
+  const fs = require('fs');
+  const pkgName = 'deepseek-desktop';
+  const dataDir = app.getPath('userData');
+  // deb 装过 /opt 下才会有 Uninstall 之外的目录;用它判断"是 deb 还是 AppImage"
+  const debInstalled = fs.existsSync('/opt/DeepSeek Desktop');
+  const lines = [];
+  if (isAppImage && !debInstalled) {
+    lines.push('本应用以 AppImage 形式运行,直接删除该文件即可完成"卸载"。');
+    lines.push('');
+    lines.push(`AppImage: ${process.env.APPIMAGE}`);
+    lines.push('');
+    lines.push('如需一并清除配置与登录态:');
+    lines.push(`  rm -rf "${dataDir}"`);
+  } else {
+    lines.push('本应用由系统包管理器安装,请用 apt 卸载:');
+    lines.push('');
+    lines.push(`  sudo apt remove ${pkgName}`);
+    lines.push('');
+    lines.push('如需一并删除配置与登录态:');
+    lines.push(`  rm -rf "${dataDir}"`);
+    lines.push('');
+    lines.push('(也可在"软件"或"应用中心"里搜索 DeepSeek 卸载)');
+  }
+  dialog
+    .showMessageBox({
+      type: 'info',
+      title: '卸载 DeepSeek',
+      message: 'Linux 上请使用系统包管理器卸载',
+      detail: lines.join('\n'),
+      buttons: ['复制命令', '关闭'],
+      defaultId: 0,
+      cancelId: 1,
+    })
+    .then(({ response }) => {
+      if (response !== 0) return;
+      const cmd = isAppImage && !debInstalled ? `rm -f "${process.env.APPIMAGE}"` : `sudo apt remove ${pkgName}`;
+      clipboard.writeText(cmd);
+      shellToast('卸载命令已复制到剪贴板');
+    })
+    .catch(() => {});
+}
+
 // ---------------- 菜单上下文(托盘 + 悬浮球菜单共用的渲染依据) ----------------
 // 只描述"当前是什么状态",不决定"有哪些项" —— 项序/分组在 modules/menu-model.js。
 // 函数声明会提升,所以装配区(tray/ballMenu)可以先引用再定义。
 
 // 读取开机启动状态。⚠️ 不能传 name:Windows 下 get 的 openAtLogin 固定读 AppUserModelId 值名,
 // 传 name 会被忽略 ⇒ 永远读回 false(1.1.4 托盘勾选"勾不上"的根源,详见文件头常量注释)。
+// Linux:Electron 的 set/getLoginItemSettings 在该平台是空实现(不报错、也不生效),
+// 必须走 XDG autostart .desktop(modules/autostart.js),否则勾选框会永远不亮。
 function isAutoStartOn() {
+  if (process.platform === 'linux') {
+    try {
+      return require('./modules/autostart').isEnabled();
+    } catch (e) {
+      return false;
+    }
+  }
   try {
     return !!app.getLoginItemSettings({ path: process.execPath }).openAtLogin;
   } catch (e) {
     return false;
   }
+}
+
+// 写入开机启动状态(与 isAutoStartOn 同一口径分平台)
+function setAutoStartOn(next) {
+  if (process.platform === 'linux') {
+    try {
+      const a = require('./modules/autostart').create({ log });
+      return a.set(!!next);
+    } catch (e) {
+      log('[settings] autostart 写入失败:', e.message);
+      return false;
+    }
+  }
+  // 只传 path,不传 name —— 值名走 AppUserModelId,与 get 的读取口径保持一致(详见文件头常量注释)
+  app.setLoginItemSettings({ openAtLogin: !!next, path: process.execPath });
+  return true;
 }
 
 function menuContext() {
@@ -697,9 +773,10 @@ function onUiAction(name, payload) {
     }
     case 'toggle-autostart': {
       const next = payload && typeof payload.checked === 'boolean' ? payload.checked : !isAutoStartOn();
-      // 只传 path,不传 name —— 值名走 AppUserModelId,与 get 的读取口径保持一致(详见文件头常量注释)
-      app.setLoginItemSettings({ openAtLogin: next, path: process.execPath });
-      log('[settings] autoStart =', next, '-> registry now:', isAutoStartOn());
+      // 分平台口径:Windows 走 setLoginItemSettings(值名走 AppUserModelId,不传 name),
+      // Linux 走 XDG autostart .desktop —— Electron 在 Linux 上该 API 是空实现
+      setAutoStartOn(next);
+      log('[settings] autoStart =', next, '-> now:', isAutoStartOn());
       tray.refresh();
       break;
     }
@@ -890,7 +967,8 @@ app.whenReady().then(() => {
   setupAppMenu();
   // 开机启动默认开:仅首次启动(打包版)自动设置,记录标记后不再干预(用户可托盘关闭)
   if (app.isPackaged && !mode.isAutoStartInit()) {
-    app.setLoginItemSettings({ openAtLogin: true, path: process.execPath });
+    // Linux 写 ~/.config/autostart/*.desktop,Windows 写注册表 Run 键(见 setAutoStartOn)
+    setAutoStartOn(true);
     mode.markAutoStartInit();
   }
   migrateAutostart(); // 迁移历史遗留自启项(旧值名 -> AppUserModelId);无旧项时不做任何改动
@@ -933,6 +1011,8 @@ app.whenReady().then(() => {
   let wasFullscreen = false;
   let fsCheckRunning = false; // 防止 PS 进程堆积
   let fsCheckTimer = null;
+  // Linux 前台探测句柄(惰性创建,只在非 win32 平台的 runFsCheck 里用到)
+  let x11Foreground = null;
   // 内嵌 PowerShell 脚本:打包后 asar 内的 .ps1 无法被 powershell -File 读取执行,必须内嵌
   // (与 check-fullscreen.ps1 保持同步,smoke-test 逐行比对)
   const FS_CHECK_SCRIPT = `
@@ -1068,52 +1148,76 @@ app.whenReady().then(() => {
     if (fsCheckTimer) clearTimeout(fsCheckTimer);
     fsCheckTimer = setTimeout(runFsCheck, delay);
   }
-  function runFsCheck() {
-    if (fsCheckRunning) return; // 上次还没完成就跳过
-    fsCheckRunning = true;
+  // 探测后端契约:probe(cb) → cb(err, { fullscreen, processName })
+  //   Windows:powershell 跑内嵌 FS_CHECK_SCRIPT(解析 "FULLSCREEN|chrome")
+  //   Linux  :xprop/xwininfo(modules/x11-foreground.js);探测不可用时**正常返回非全屏**,
+  //            绝不以 err 形式把整条检测链打断(否则 wasFullscreen 卡 true,桌宠永久消失)
+  function probeWindows(cb) {
     execFile(
       'powershell',
       ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', FS_CHECK_SCRIPT],
       // DS_FG_MODE 门控:开关关闭时不采集任何前台信息
       { timeout: 4000, windowsHide: true, env: { ...MINIMAL_ENV, DS_FG_MODE: mode.getForegroundAware() ? '1' : '0' } },
       (err, stdout) => {
-        fsCheckRunning = false;
-        try {
-          if (err) {
-            // 单次失败不能终结检测链:保持上次判定,按低频继续重试。
-            // 否则恰逢"全屏隐藏中"失败时,wasFullscreen 恒为 true,
-            // 悬浮球/鲸鱼娘将永久隐藏、永不恢复(实测 2026-09-05 复现)
-            log('[fullscreen] check failed:', err.message);
-            scheduleFsCheck(FS_CHECK_INTERVAL.windowed);
-          } else {
-            const out = String(stdout || '');
-            const [flag, proc] = out.split('|');
-            const isFs = flag === 'FULLSCREEN';
-            // 去抖:命中要连续 FS_ENTER_CONFIRM 次才真正隐藏;未命中立刻清零并当次恢复。
-            // 这样浏览器的 F11 切换动画、最大化→全屏的中间态都不会把桌宠闪没。
-            if (isFs) fsEnterStreak++;
-            else fsEnterStreak = 0;
-            const confirmedFs = isFs && fsEnterStreak >= FS_ENTER_CONFIRM;
-            if (confirmedFs && !wasFullscreen) {
-              mode.hideForFs(); // 隐藏当前显示模式窗口(悬浮球或鲸鱼娘)
-              wasFullscreen = true;
-            } else if (!isFs && wasFullscreen) {
-              mode.restoreFromFs();
-              wasFullscreen = false;
-            }
-            // 前台上下文:仅感知开启(脚本才返回进程名)且非全屏(桌宠已隐藏)时广播
-            if (!isFs && proc && proc !== 'unknown') {
-              const category = focus.classify(proc);
-              if (category !== lastContext) broadcastContext(category);
-            }
-            // 已确认全屏但还在攒次数期间,也按高频轮询,尽快凑够确认
-            scheduleFsCheck(isFs ? FS_CHECK_INTERVAL.fullscreen : FS_CHECK_INTERVAL.windowed);
-          }
-        } catch (e) {
-          /* ignore */
-        }
-      }
+        if (err) return cb(err);
+        const [flag, proc] = String(stdout || '').split('|');
+        cb(null, { fullscreen: flag === 'FULLSCREEN', processName: proc || null });
+      },
     );
+  }
+
+  function probeLinux(cb) {
+    try {
+      // 惰性 require:非 Linux 平台不需要这条链路,也让 require-check 的 stub 环境更干净
+      if (!x11Foreground) x11Foreground = require('./modules/x11-foreground').create({ log });
+      x11Foreground.probe(mode.getForegroundAware(), (err, res) => cb(err, res));
+    } catch (e) {
+      // 模块缺失/加载失败:降级为"非全屏",下一轮继续(不抛错、不终止轮询)
+      cb(null, { fullscreen: false, processName: null });
+    }
+  }
+
+  const fsProbe = process.platform === 'win32' ? probeWindows : probeLinux;
+
+  function runFsCheck() {
+    if (fsCheckRunning) return; // 上次还没完成就跳过
+    fsCheckRunning = true;
+    fsProbe((err, res) => {
+      fsCheckRunning = false;
+      try {
+        if (err) {
+          // 单次失败不能终结检测链:保持上次判定,按低频继续重试。
+          // 否则恰逢"全屏隐藏中"失败时,wasFullscreen 恒为 true,
+          // 悬浮球/鲸鱼娘将永久隐藏、永不恢复(实测 2026-09-05 复现)
+          log('[fullscreen] check failed:', err.message);
+          scheduleFsCheck(FS_CHECK_INTERVAL.windowed);
+          return;
+        }
+        const isFs = !!(res && res.fullscreen);
+        const proc = res && res.processName;
+        // 去抖:命中要连续 FS_ENTER_CONFIRM 次才真正隐藏;未命中立刻清零并当次恢复。
+        // 这样浏览器的 F11 切换动画、最大化→全屏的中间态都不会把桌宠闪没。
+        if (isFs) fsEnterStreak++;
+        else fsEnterStreak = 0;
+        const confirmedFs = isFs && fsEnterStreak >= FS_ENTER_CONFIRM;
+        if (confirmedFs && !wasFullscreen) {
+          mode.hideForFs(); // 隐藏当前显示模式窗口(悬浮球或鲸鱼娘)
+          wasFullscreen = true;
+        } else if (!isFs && wasFullscreen) {
+          mode.restoreFromFs();
+          wasFullscreen = false;
+        }
+        // 前台上下文:仅感知开启(探测才返回进程名)且非全屏(桌宠已隐藏)时广播
+        if (!isFs && proc && proc !== 'unknown') {
+          const category = focus.classify(proc);
+          if (category !== lastContext) broadcastContext(category);
+        }
+        // 已确认全屏但还在攒次数期间,也按高频轮询,尽快凑够确认
+        scheduleFsCheck(isFs ? FS_CHECK_INTERVAL.fullscreen : FS_CHECK_INTERVAL.windowed);
+      } catch (e) {
+        /* ignore */
+      }
+    });
   }
 
   // 前台感知开关联动:只影响"前台上下文动画"(是否采集前台进程名),**不影响全屏隐藏**。

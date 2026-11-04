@@ -8,6 +8,7 @@ const Module = require('module');
 
 const ROOT = path.join(__dirname, '..');
 const os = require('os');
+const fs = require('fs');
 
 // ---- electron stub(仅满足顶层引用,不创建真实窗口) ----
 const electronStub = {
@@ -737,6 +738,176 @@ if (!security.isPrivateHostname('192.168.1.1') || !security.isPrivateHostname('l
   if (leaked.length) {
     console.error('FAIL: 模型字段漏进原生菜单模板:', leaked.map((i) => i.label).join(','));
     failed += 1;
+  }
+}
+
+// ---- Linux 平台模块:纯函数级验证(不依赖 X11 / 桌面环境,Windows 上也能跑) ----
+// 这两个模块是 Windows 专属能力的替代物,一旦解析逻辑错了,后果是"桌宠永久消失"
+// 或"开机启动勾了没反应"这类只能靠真机才能发现的故障,所以在这里把解析/生成逻辑钉死。
+{
+  const x11 = require(path.join(ROOT, 'modules', 'x11-foreground'));
+  for (const m of ['parseActiveWindow', 'parseProps', 'parseGeometry', 'coversDisplay', 'judge', 'create']) {
+    if (typeof x11[m] !== 'function') {
+      console.error(`FAIL: x11-foreground.${m} 缺失`);
+      failed += 1;
+    }
+  }
+
+  // ① 活动窗口 id:xprop 带/不带 -notype 两种输出都要认
+  //    真实格式里没有 "=" (是 "window id # 0x3600003"),早期用 /=/ 匹配会恒返回 null
+  const activeCases = [
+    ['_NET_ACTIVE_WINDOW(WINDOW): window id # 0x3600003', '0x3600003'],
+    ['_NET_ACTIVE_WINDOW: window id # 0x3600003', '0x3600003'],
+    ['_NET_ACTIVE_WINDOW(WINDOW): window id # 0x0', null], // 无活动窗口 = 桌面本身
+    ['_NET_ACTIVE_WINDOW:  not found.', null],
+  ];
+  for (const [input, want] of activeCases) {
+    const got = x11.parseActiveWindow(input);
+    if (got !== want) {
+      console.error(`FAIL: parseActiveWindow(${JSON.stringify(input)}) 应为 ${want}, 实得 ${got}`);
+      failed += 1;
+    }
+  }
+
+  // ② EWMH 状态:全屏 / 最大化必须分别识别;WM_CLASS 取最后一段(实例名 → 类名)
+  const propsFs = x11.parseProps([
+    '_NET_WM_STATE(ATOM) = _NET_WM_STATE_FULLSCREEN',
+    '_NET_WM_PID(CARDINAL) = 3312',
+    'WM_CLASS(STRING) = "Navigator", "firefox"',
+  ].join('\n'));
+  if (!propsFs.fullscreen || propsFs.maximized || propsFs.pid !== 3312 || propsFs.wmClass !== 'firefox') {
+    console.error('FAIL: parseProps 全屏用例解析错误:', JSON.stringify(propsFs));
+    failed += 1;
+  }
+  // -notype 时没有类型后缀,正则必须容忍(否则 Linux 上恒判非全屏,桌宠永不隐藏)
+  const propsNoType = x11.parseProps('_NET_WM_STATE = _NET_WM_STATE_MAXIMIZED_VERT, _NET_WM_STATE_MAXIMIZED_HORZ');
+  if (propsNoType.fullscreen || !propsNoType.maximized) {
+    console.error('FAIL: parseProps(-notype) 解析错误:', JSON.stringify(propsNoType));
+    failed += 1;
+  }
+  // 面板/工具窗口:skip 掉任务栏的窗口不应被当成"全屏"而隐藏桌宠
+  const propsPanel = x11.parseProps([
+    '_NET_WM_STATE(ATOM) = _NET_WM_STATE_SKIP_TASKBAR',
+    'WM_CLASS(STRING) = "gnome-panel", "Gnome-panel"',
+  ].join('\n'));
+  if (!propsPanel.skipTaskbar) {
+    console.error('FAIL: parseProps 未识别 _NET_WM_STATE_SKIP_TASKBAR');
+    failed += 1;
+  }
+
+  // ③ xwininfo 几何解析
+  const geoText = [
+    '  Absolute upper-left X:  0',
+    '  Absolute upper-left Y:  0',
+    '  Width: 1920',
+    '  Height: 1080',
+  ].join('\n');
+  const geo = x11.parseGeometry(geoText);
+  if (!geo || geo.x !== 0 || geo.y !== 0 || geo.w !== 1920 || geo.h !== 1080) {
+    console.error('FAIL: parseGeometry 解析错误:', JSON.stringify(geo));
+    failed += 1;
+  }
+  if (x11.parseGeometry('garbage') !== null) {
+    console.error('FAIL: parseGeometry 对无效输入应返回 null');
+    failed += 1;
+  }
+
+  // ④ 铺满判定:必须接受 Electron Display.bounds 的 width/height 键(不是 w/h)
+  //    早期只读 b.w/b.h ⇒ coversDisplay 恒 false ⇒ 全屏时桌宠永不隐藏(已修的 bug)
+  const screens = [{ x: 0, y: 0, width: 1920, height: 1080 }];
+  if (!x11.coversDisplay({ x: 0, y: 0, w: 1920, h: 1080 }, screens, x11.TOLERANCE)) {
+    console.error('FAIL: coversDisplay 未识别铺满(electron bounds 用 width/height)');
+    failed += 1;
+  }
+  if (x11.coversDisplay({ x: 100, y: 100, w: 600, h: 400 }, screens, x11.TOLERANCE)) {
+    console.error('FAIL: coversDisplay 不应把普通窗口判成铺满');
+    failed += 1;
+  }
+
+  // ⑤ 判定链:state 直接判全屏;最大化不算全屏(与 Windows 版一致);副屏全屏也要算
+  const j1 = x11.judge({
+    props: x11.parseProps('_NET_WM_STATE(ATOM) = _NET_WM_STATE_FULLSCREEN'),
+    geometry: null,
+    screens,
+  });
+  if (!j1.fullscreen) {
+    console.error('FAIL: judge 应把 _NET_WM_STATE_FULLSCREEN 判为全屏');
+    failed += 1;
+  }
+  const j2 = x11.judge({
+    props: x11.parseProps('_NET_WM_STATE(ATOM) = _NET_WM_STATE_MAXIMIZED_VERT, _NET_WM_STATE_MAXIMIZED_HORZ'),
+    geometry: { x: 0, y: 0, w: 1920, h: 1080 },
+    screens,
+  });
+  if (j2.fullscreen) {
+    console.error('FAIL: judge 不应把最大化窗口判为全屏');
+    failed += 1;
+  }
+  const twoScreens = [
+    { x: 0, y: 0, width: 1920, height: 1080 },
+    { x: 1920, y: 0, width: 1280, height: 1024 },
+  ];
+  const j3 = x11.judge({
+    props: x11.parseProps(''),
+    geometry: { x: 1920, y: 0, w: 1280, h: 1024 },
+    screens: twoScreens,
+  });
+  if (!j3.fullscreen) {
+    console.error('FAIL: judge 应识别副屏上的全屏窗口');
+    failed += 1;
+  }
+
+  // ⑥ autostart:.desktop 生成(XDG 规范字段 + Exec 引号转义)
+  const autostart = require(path.join(ROOT, 'modules', 'autostart'));
+  for (const m of ['isEnabled', 'setEnabled', 'desktopPath', 'desktopEntry', 'targetExec', 'create']) {
+    if (typeof autostart[m] !== 'function') {
+      console.error(`FAIL: autostart.${m} 缺失`);
+      failed += 1;
+    }
+  }
+  const entry = autostart.desktopEntry('/opt/DeepSeek Desktop/deepseek-desktop');
+  for (const key of ['[Desktop Entry]', 'Type=Application', 'Name=DeepSeek', 'Terminal=false', 'X-GNOME-Autostart-enabled=true']) {
+    if (!entry.includes(key)) {
+      console.error(`FAIL: desktopEntry 缺少 ${key}`);
+      failed += 1;
+    }
+  }
+  // 路径含空格必须整体加引号,否则桌面环境会按空格截断 Exec
+  if (!entry.includes('Exec="/opt/DeepSeek Desktop/deepseek-desktop"')) {
+    console.error('FAIL: desktopEntry 的 Exec 未对含空格路径加引号');
+    failed += 1;
+  }
+  // 文件名必须与 package.json 的 desktopName 一致,否则会和菜单项/窗口关联对不上
+  if (!autostart.desktopPath().endsWith('deepseek-desktop.desktop')) {
+    console.error('FAIL: autostart 文件名应为 deepseek-desktop.desktop');
+    failed += 1;
+  }
+  // 启停往返:写到临时 XDG_CONFIG_HOME,不动用户真实配置
+  {
+    const tmpConfig = fs.mkdtempSync(path.join(os.tmpdir(), 'ds-autostart-'));
+    const oldXdg = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = tmpConfig;
+    try {
+      const a = autostart.create({ log: () => {} });
+      if (a.isEnabled()) {
+        console.error('FAIL: 未写入时 isEnabled 应为 false');
+        failed += 1;
+      }
+      a.set(true);
+      if (!a.isEnabled()) {
+        console.error('FAIL: set(true) 后 isEnabled 应为 true');
+        failed += 1;
+      }
+      a.set(false);
+      if (a.isEnabled()) {
+        console.error('FAIL: set(false) 后 isEnabled 应为 false');
+        failed += 1;
+      }
+    } finally {
+      if (oldXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = oldXdg;
+      fs.rmSync(tmpConfig, { recursive: true, force: true });
+    }
   }
 }
 

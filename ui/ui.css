@@ -12,7 +12,8 @@ html,
 body {
   background: transparent;
   overflow: hidden;
-  font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+  font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", "Source Han Sans SC",
+    "WenQuanYi Micro Hei", "Droid Sans Fallback", "Segoe UI", "Ubuntu", sans-serif;
 }
 
 /* ---------- 悬浮球 ---------- */

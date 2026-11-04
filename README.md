@@ -29,9 +29,22 @@
 
 ### 下载安装包
 
-前往 [Releases](https://github.com/xmbl4399/deepseek-maid/releases) 下载最新的 `DeepSeek-Desktop-Setup-<版本>.exe`，一路下一步即可（可勾选桌面快捷方式）。
+**Windows**：前往 [Releases](https://github.com/xmbl4399/deepseek-maid/releases) 下载最新的 `DeepSeek-Desktop-Setup-<版本>.exe`，一路下一步即可（可勾选桌面快捷方式）。
 
 > 安装包文件名仍是 `DeepSeek-Desktop-Setup`，原因见 [常见问题](#常见问题)。
+
+**Ubuntu / Debian 系**：同一个 Release 里另有 `.deb` 与 `.AppImage` 两种产物。
+
+```bash
+# 方式一:deb(推荐,进系统菜单、可用 apt 卸载、开机启动走标准 XDG 机制)
+sudo apt install ./DeepSeek-Desktop-<版本>-amd64.deb
+
+# 方式二:AppImage(免安装,拷到哪都能跑)
+chmod +x DeepSeek-Desktop-<版本>-x86_64.AppImage
+./DeepSeek-Desktop-<版本>-x86_64.AppImage
+```
+
+卸载：deb 用 `sudo apt remove deepseek-desktop`，AppImage 直接删文件。应用内「卸载」菜单在 Linux 上会给出对应命令并复制到剪贴板（Linux 没有 NSIS 卸载器，只能交给包管理器）。
 
 ### 从源码构建
 
@@ -45,9 +58,19 @@ npm run lint     # ESLint
 npm run build    # 打包 Windows 安装包，输出到 release/
 ```
 
-> 构建需要 Windows + Node 18+。若杀毒软件对输出目录持句柄导致 `EBUSY / EPERM`，
+> 构建需要 Node 18+；`npm run build` 是 Windows 目标，在 Windows 上执行。若杀毒软件对输出目录持句柄导致 `EBUSY / EPERM`，
 > 把构建输出指到项目外目录再试：
 > `npx electron-builder --win --publish never --config.directories.output=%TEMP%\dsbuild`
+
+**构建 Ubuntu 安装包**必须在 Linux 上做（`deb` 依赖 `fpm`，`AppImage` 依赖 `mksquashfs`，两者都是 Linux 可执行文件，无法在 Windows/macOS 上交叉产出）：
+
+```bash
+sudo apt install -y fakeroot dpkg xz-utils
+npx electron-builder --linux --publish never   # 输出 release/*.deb 与 *.AppImage
+```
+
+仓库已配好 CI：`.github/workflows/build.yml` 的 `build-linux` job 在 `ubuntu-latest` 上自动完成上述步骤，
+打 `v*` tag 时随 Release 一起发布，手动触发（Actions → Run workflow）则上传为 artifact 供下载。
 
 ---
 
@@ -142,6 +165,21 @@ npm run build    # 打包 Windows 安装包，输出到 release/
 
 **触屏上长按文字总是直接弹菜单？**
 是设计上的「两段式」：第一次长按只框选文字，确认选区后再长按才弹菜单 —— 想换一段文字时不会被菜单打断。
+
+**Ubuntu 上有哪些功能会降级？**
+主干功能（多标签、登录态、框选截图提问、悬浮球/鲸鱼女仆、托盘菜单、快捷键）与 Windows 一致。以下依赖 Windows 专有能力，Linux 上换成了等价实现，个别场景会有差异：
+
+| 能力 | Windows | Ubuntu |
+| --- | --- | --- |
+| 全屏检测（决定桌宠是否避让） | `user32.dll`，进程名精确 | `xprop` + `xwininfo`（同属 `x11-utils`）读 EWMH 状态；**Wayland 原生会话下测不到**，会退化为不检测（桌宠不避让，但不影响其他功能） |
+| 开机启动 | 注册表 Run 项 | `~/.config/autostart/deepseek-desktop.desktop`（XDG 标准）；AppImage 场景自动指向 `$APPIMAGE` 本体，避免挂载点变化导致失效 |
+| 卸载 | 调用 NSIS 卸载器 | 无 NSIS，改为弹窗给出 `sudo apt remove deepseek-desktop` 并复制到剪贴板 |
+| 托盘气泡提示 | `displayBalloon` | 系统 `Notification`；GNOME 默认不显示托盘图标，此时只能靠快捷键/主窗口操作，**不会崩溃** |
+| 窗口透明（桌宠/悬浮球） | 原生支持 | 需要合成器；X11 下正常，纯 Wayland 下可能不透明或位置偏移 |
+| 自动更新 | `electron-updater` + NSIS | 仅 AppImage 支持（需 `$APPIMAGE`）；deb 装的版本请用 `apt upgrade` |
+
+**为什么 Linux 上没有 `check-fullscreen.ps1` 的对应脚本文件？**
+Windows 那份 PowerShell 脚本是内嵌在 `main.js` 里的（便于单文件分发，且有测试逐行校验它与 `check-fullscreen.ps1` 同步）。Linux 侧逻辑较多（解析 xprop/xwininfo 输出、多显示器判定、降级），放进独立模块 `modules/x11-foreground.js` 更好维护，也便于用纯函数单测覆盖 —— 这类逻辑一旦出错，表现是"桌宠该收起时不收起 / 永久消失"，只能靠单测兜住。
 
 ---
 
