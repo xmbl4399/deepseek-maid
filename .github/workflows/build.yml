@@ -70,9 +70,9 @@ jobs:
           cache: npm
       - run: npm ci
 
-      # electron-builder 首次打 deb 时会去 GitHub 下载 fpm(AppImage 形式的 ruby 包)并缓存到
-      # ~/.cache/electron-builder。这里预装 dpkg/fakeroot/xz,并前置一次 fpm 预热,
-      # 避免 runner 上偶发的下载超时把整次构建拖红。
+      # deb 由 electron-builder 内置的 fpm 产出(首次运行会下载一个 AppImage 形式的 ruby
+      # 运行时并缓存到 ~/.cache/electron-builder);fpm 调用 dpkg-deb/fakeroot/xz,
+      # ubuntu-latest 默认只有 dpkg,另两个要自己装。
       - name: 准备 deb 打包工具链
         run: |
           sudo apt-get update
