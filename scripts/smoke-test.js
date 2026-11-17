@@ -57,6 +57,7 @@ const REQUIRED_FILES = [
   'modules/menu-model.js',
   'modules/topmost.js',
   'modules/x11-foreground.js',
+  'modules/win32-foreground.js',
   'modules/autostart.js',
 ];
 
@@ -218,6 +219,7 @@ test('JS 语法检查(node --check)', () => {
     'modules/menu-model.js',
     'modules/topmost.js',
     'modules/x11-foreground.js',
+    'modules/win32-foreground.js',
     'modules/autostart.js',
   ];
   for (const f of jsFiles) {
@@ -252,9 +254,10 @@ test('main.js 与模块包含关键修复', () => {
   assert.ok(main.includes('requestSingleInstanceLock'), '缺少单实例锁');
   assert.ok(!allJs.includes('globalShortcut'), '不应使用全局快捷键(易冲突,用窗口内 before-input-event)');
   assert.ok(security.includes('setWindowOpenHandler'), '缺少 window.open 拦截');
-  assert.ok(main.includes('FS_CHECK_SCRIPT'), '缺少内嵌全屏检测脚本');
+  assert.ok(main.includes('win32Foreground'), '缺少 Windows 原生全屏探测后端接入');
   assert.ok(updater.includes('autoUpdater'), '缺少自动更新');
-  assert.ok(!main.includes('check-fullscreen.ps1') || main.includes('内嵌'), '不应依赖外部 ps1 文件');
+  // 不再依赖任何 PowerShell 脚本(原 FS_CHECK_SCRIPT / check-fullscreen.ps1 已由原生探测取代)
+  assert.ok(!main.includes('powershell'), '不应再 spawn powershell(改为进程内 P/Invoke)');
 });
 
 test('主窗口为多标签壳(webview 标签栏 + 安全校验)', () => {
@@ -293,14 +296,48 @@ test('主窗口为多标签壳(webview 标签栏 + 安全校验)', () => {
   assert.ok(shortcuts.includes("'t'"), '缺少 Ctrl+T 新标签');
 });
 
-test('内嵌全屏检测脚本与 check-fullscreen.ps1 保持同步', () => {
+test('Windows 全屏探测走进程内 P/Invoke,不再启动 PowerShell', () => {
   const main = read('main.js');
-  const m = main.match(/const FS_CHECK_SCRIPT = `([\s\S]*?)`;/);
-  assert.ok(m, '未找到内嵌 FS_CHECK_SCRIPT');
-  // 去掉注释行和空白后逐行对比,防止改了 ps1 忘改内嵌副本
-  const norm = (s) =>
-    s.split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#')).join('\n');
-  assert.strictEqual(norm(m[1]), norm(read('check-fullscreen.ps1')), '内嵌脚本与 ps1 文件不一致');
+  const win32 = read('modules/win32-foreground.js');
+  // 回归守门:原实现每 3 秒 spawn 一次 powershell.exe + Add-Type 现场编译 C#,
+  // 行为画像与"利用 PowerShell 执行可疑脚本"重合,会被杀毒软件稳定拦截(火绒实测必报)。
+  // 这条断言防止有人把 PowerShell 方案改回来。
+  assert.ok(!main.includes('FS_CHECK_SCRIPT'), '内嵌 PowerShell 脚本应已删除');
+  assert.ok(!main.includes('ExecutionPolicy'), '不应再出现 -ExecutionPolicy Bypass');
+  assert.ok(!/execFile\(\s*'powershell'/.test(main), '不应再 execFile powershell');
+  assert.ok(!main.includes('Add-Type'), '不应再依赖 Add-Type(会写 %TEMP%\\*.cs)');
+  // 新实现:进程内 koffi 绑定,零子进程、零临时文件、零代码生成
+  assert.ok(win32.includes('koffi'), 'Windows 探测应使用 koffi 做进程内 P/Invoke');
+  assert.ok(win32.includes("koffi.load('user32.dll')"), '应直接绑定 user32.dll');
+  assert.ok(!win32.includes('child_process'), '原生探测不应有子进程依赖');
+  // 判据必须与原 ps1 逐条对齐:外壳黑名单 / 标题栏 / 工作区分水岭 / 容差
+  assert.ok(win32.includes('SHELL_CLASSES'), '缺少外壳窗口黑名单');
+  for (const cls of ['Progman', 'Shell_TrayWnd', 'Windows.UI.Core.CoreWindow', 'ApplicationFrameHost']) {
+    assert.ok(win32.toLowerCase().includes(cls.toLowerCase()), `外壳黑名单缺少 ${cls}`);
+  }
+  assert.ok(win32.includes('WS_CAPTION'), '缺少标题栏判据');
+  assert.ok(win32.includes('rcWork'), '缺少工作区判据(最大化和真全屏的分水岭)');
+  assert.ok(win32.includes('TOLERANCE'), '缺少像素容差');
+  assert.ok(win32.includes('IsZoomed'), '缺少非最大化判据');
+  assert.ok(win32.includes('GetClassNameW'), '应读窗口类名做外壳黑名单比对');
+  // 隐私门控:wantProc 为假时不得读取进程名
+  assert.ok(/probe\(wantProc/.test(win32), 'probe 应接受 wantProc 开关');
+  // 降级:绑定失败必须返回"非全屏",绝不能抛错打断检测链(否则桌宠永久隐藏)
+  assert.ok(win32.includes('broken'), '缺少绑定失败降级标记');
+  assert.ok(/fullscreen:\s*false, processName: null/.test(win32), '失败时应回退为非全屏');
+  // 与原实现等价的失败处理:单次异常不终结轮询
+  assert.ok(/reason: 'error:/.test(win32), '缺少单次异常兜底');
+  // 打包配置:原生模块必须解包到 asar 外,否则运行时无法加载 .node
+  const pkg = JSON.parse(read('package.json'));
+  assert.ok(pkg.dependencies.koffi, '缺少 koffi 依赖');
+  assert.ok(
+    Array.isArray(pkg.build.asarUnpack) && pkg.build.asarUnpack.some((g) => g.includes('koffi')),
+    'asarUnpack 必须解包 koffi 原生模块(asar 内的 .node 无法 dlopen)',
+  );
+  assert.ok(
+    (pkg.build.files || []).some((g) => g.includes('koffi')),
+    'build.files 白名单必须包含 koffi(否则不进包)',
+  );
 });
 
 test('托盘菜单来自共用模型(项序/分组单一来源),弹出前重建保证勾选不过期', () => {
@@ -502,9 +539,15 @@ test('前台感知:焦点在 DeepSeek 触发 + 程序分类 + 开关门控装配
   // mode:前台感知开关设置(默认开,持久化)
   assert.ok(mode.includes('foregroundAware'), 'mode 应管理 foregroundAware 设置');
   assert.ok(mode.includes('getForegroundAware') && mode.includes('setForegroundAware'), '缺少前台感知读写');
-  // 主进程:装配 focus;全屏脚本 DS_FG_MODE 门控;上下文广播
+  // 主进程:装配 focus;前台感知开关门控进程名采集;上下文广播
   assert.ok(main.includes("require('./modules/focus')"), 'main.js 未装配 focus 模块');
-  assert.ok(main.includes('DS_FG_MODE'), '全屏脚本缺少 DS_FG_MODE 门控(关=不读前台)');
+  // 隐私门控由原来的 DS_FG_MODE 环境变量改为 probe 的 wantProc 参数(不再有 PowerShell 环境块);
+  // 语义不变:开关关闭时不读取前台进程名。这里钉住"开关状态确实被传进了探测层"。
+  assert.ok(
+    main.includes('fsProbe(mode.getForegroundAware(), (err, res) => {'),
+    '全屏探测未按前台感知开关门控(关=不读前台进程名)',
+  );
+  assert.ok(!main.includes('DS_FG_MODE'), 'DS_FG_MODE 已随 PowerShell 方案一并移除,不应残留');
   assert.ok(main.includes("'pet-context'"), '缺少前台上下文广播 pet-context');
   // focus:进程名分类(含本应用 deepseek)
   assert.ok(focus.includes('function classify'), '缺少前台进程分类');
@@ -691,10 +734,11 @@ test('Linux 平台分支:全屏探测 / 开机自启 / 卸载 / 托盘 均已适
   assert.ok(main.includes('function probeWindows('), '缺少 Windows 探测后端');
   assert.ok(main.includes('function probeLinux('), '缺少 Linux 探测后端');
   assert.ok(main.includes("require('./modules/x11-foreground')"), 'Linux 探测应复用 x11-foreground 模块');
-  // 两个后端必须同契约 (err, {fullscreen, processName}),否则外层去抖逻辑会读到 undefined
-  assert.ok(/fullscreen:\s*flag === 'FULLSCREEN'/.test(main), 'Windows 后端应返回 fullscreen 布尔');
-  // 内嵌 PowerShell 脚本仍须保留(Windows 侧行为不变;逐行与 check-fullscreen.ps1 同步的断言在上方)
-  assert.ok(main.includes('FS_CHECK_SCRIPT'), '内嵌全屏检测脚本被误删');
+  // 两个后端必须同契约 (wantProc, cb) → cb(null, {fullscreen, processName})，
+  // 否则外层去抖逻辑会读到 undefined
+  assert.ok(main.includes("require('./modules/win32-foreground')"), 'Windows 探测应复用 win32-foreground 模块');
+  assert.ok(/probe\(wantProc, cb\)/.test(main), 'Windows 后端应按 wantProc 契约转发');
+  // 内嵌 PowerShell 脚本已删除(改由原生探测取代),不应再出现
 
   // ---- x11-foreground:纯解析函数必须存在且不依赖 shell ----
   for (const fn of ['parseActiveWindow', 'parseProps', 'parseGeometry', 'coversDisplay', 'judge']) {

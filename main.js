@@ -765,7 +765,7 @@ function onUiAction(name, payload) {
       break;
     }
     case 'toggle-foreground': {
-      // 前台感知开关:关 = 完全不读取前台窗口(全屏自动隐藏与前台上下文动画同时失效)
+      // 前台感知开关:关 = 不再采集前台进程名(全屏自动隐藏照常工作,v1.2.0 起解耦)
       const next = payload && typeof payload.checked === 'boolean' ? payload.checked : !mode.getForegroundAware();
       actions.setForegroundAware(next);
       tray.refresh();
@@ -1006,127 +1006,20 @@ app.whenReady().then(() => {
   // 前台感知(由"前台感知开关"统一控制,默认开):
   //   - 全屏自动隐藏:全屏播放视频/游戏时隐藏悬浮球/鲸鱼娘,退出恢复
   //   - 前台上下文:空闲时按前台程序类型驱动桌宠小动作
-  //   开关关闭时:完全不读取前台窗口(DS_FG_MODE 门控),两项功能同时失效(隐私默认)
-  const { execFile } = require('child_process');
+  //   开关关闭时:探测层不再读取前台进程名(隐私门控),全屏判定照常工作
+  //   —— 全屏隐藏与隐私开关是两件事:v1.2.0 起解耦,关掉感知不会连带关掉避让
   let wasFullscreen = false;
-  let fsCheckRunning = false; // 防止 PS 进程堆积
+  let fsCheckRunning = false; // 防止探测重入(上一轮未完成时跳过本轮)
   let fsCheckTimer = null;
-  // Linux 前台探测句柄(惰性创建,只在非 win32 平台的 runFsCheck 里用到)
+  // 平台探测后端(惰性创建,契约统一):
+  //   Windows → modules/win32-foreground.js(进程内 koffi P/Invoke,零子进程零临时文件)
+  //   Linux   → modules/x11-foreground.js(xprop/xwininfo)
+  // 两者都是 probe(wantProc, cb) → cb(null, { fullscreen, processName, reason });
+  // wantProc=false 时不读取前台进程名(隐私默认),但全屏判定照常进行。
+  // 探测不可用时**正常返回非全屏**,绝不以 err 打断检测链 —— 否则 wasFullscreen
+  // 会卡在 true,悬浮球/鲸鱼娘将永久隐藏且无法恢复。
+  let win32Foreground = null;
   let x11Foreground = null;
-  // 内嵌 PowerShell 脚本:打包后 asar 内的 .ps1 无法被 powershell -File 读取执行,必须内嵌
-  // (与 check-fullscreen.ps1 保持同步,smoke-test 逐行比对)
-  const FS_CHECK_SCRIPT = `
-  # 全屏检测脚本(独立测试/调试用)
-  # 注意:运行时实际执行的是 main.js 内嵌的 FS_CHECK_SCRIPT 副本(打包后 asar 内的 .ps1
-  # 无法被 powershell -File 读取执行)。改动此文件时请同步更新 main.js 中的内嵌脚本。
-  # 输出:FULLSCREEN / WINDOWED;DS_FG_MODE=1 时追加进程名(FULLSCREEN|chrome / WINDOWED|Code)
-  # 前台感知开关关闭时(DS_FG_MODE≠1)不读取任何前台信息(隐私门控)
-  #
-  # 判定要点(2026-10 加固,原判据"铺满屏幕且无标题栏"误判频发,实测抓到
-  # explorer/Progman 与 TextInputHost/Windows.UI.Core.CoreWindow 都是 2560x1440 无标题栏):
-  #   1. 铺满屏幕**且非最大化**,最大化窗口也铺满屏幕但不是全屏
-  #   2. 窗口类名不在**外壳黑名单**里(桌面/任务栏/输入法宿主/窗口框架代理)
-  #   3. 高度必须超过**工作区高度**:最大化窗口贴着工作区(扣掉任务栏),真全屏占满整屏
-  #      ——这条是无边框窗口(WS_POPUP)与最大化窗口的关键分水岭
-  Add-Type @'
-  using System;
-  using System.Runtime.InteropServices;
-  using System.Text;
-  public class WAPI {
-      [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
-      [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-      [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
-      [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
-      [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
-      [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr hWnd);
-      [DllImport("user32.dll")] public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
-      public struct RECT { public int Left, Top, Right, Bottom; }
-  }
-'@ | Out-Null
-
-  if (-not ('WAPI' -as [type])) { Write-Output "WINDOWED"; exit 0 }
-
-  # 让本进程 DPI aware,使 GetWindowRect(物理像素)与 Screen.Bounds 单位一致,避免缩放后误判
-  [WAPI]::SetProcessDPIAware() | Out-Null
-
-  $fw = [WAPI]::GetForegroundWindow()
-  $r = New-Object WAPI+RECT
-  [WAPI]::GetWindowRect($fw, [ref]$r) | Out-Null
-
-  Add-Type -AssemblyName System.Windows.Forms | Out-Null
-
-  $tolerance = 8  # 容忍 8px 偏差(浏览器全屏视频可能有微小边框)
-  $full = $false
-  $workH = 0
-  # 遍历所有显示器:前台窗口覆盖任一屏幕即判定铺满(支持副屏)
-  foreach ($s in [System.Windows.Forms.Screen]::AllScreens) {
-      $b = $s.Bounds
-      if ($r.Left -le ($b.Left + $tolerance) -and $r.Top -le ($b.Top + $tolerance) -and
-          $r.Right -ge ($b.Right - $tolerance) -and $r.Bottom -ge ($b.Bottom - $tolerance)) {
-          $full = $true
-          $workH = $s.WorkingArea.Height
-          break
-      }
-  }
-  # 排除"最大化/普通窗口":最大化窗口也铺满屏幕,但带标题栏(WS_CAPTION),不是全屏
-  # 真全屏窗口(浏览器 F11/视频全屏/游戏)通常无标题栏;Chromium 全屏虽带 WS_MAXIMIZE,
-  # 但无 WS_CAPTION,所以用标题栏判据(比 WS_MAXIMIZE 更准)
-  $style = [WAPI]::GetWindowLong($fw, -16)
-  $hasCaption = ($style -band 0x00C00000) -ne 0
-  $isMax = [WAPI]::IsZoomed($fw)
-
-  # 外壳窗口黑名单:桌面/任务栏/输入法候选窗/窗口框架代理。它们本就铺满屏幕且无标题栏,
-  # 一旦成为前台就会被误判成全屏(实测 Progman 与 Windows.UI.Core.CoreWindow 均中招)。
-  # 类名是 Win32 窗口类(区分大小写,统一转小写比较)
-  $cls = New-Object System.Text.StringBuilder 256
-  [WAPI]::GetClassName($fw, $cls, 256) | Out-Null
-  $clsName = $cls.ToString()
-  $shellClasses = @(
-      'Progman', 'WorkerW', 'Shell_TrayWnd', 'Shell_SecondaryTrayWnd',
-      'Windows.UI.Core.CoreWindow', 'ApplicationFrameHost',
-      'MultitaskingViewFrame', 'ForegroundStaging', 'XamlExplorerHostIslandWindow',
-      'Windows.Internal.Shell.TabProxyWindow', 'TaskListThumbnailWnd'
-  )
-  $isShell = $false
-  foreach ($c in $shellClasses) { if ($clsName -ieq $c) { $isShell = $true; break } }
-
-  # 工作区分水岭:最大化窗口高度 == 工作区高度(任务栏被扣掉);真全屏 == 整屏高度 > 工作区。
-  # 只在任务栏确实占用空间时(整屏高出工作区)才启用该判据,任务栏隐藏/自动隐藏时不误杀。
-  $screenH = $r.Bottom - $r.Top
-  $beatsWorkArea = $false
-  if ($workH -gt 0) { $beatsWorkArea = ($screenH -gt ($workH + $tolerance)) }
-  # 任务栏被自动隐藏时整屏高度也可能等于工作区,此时退回"非最大化"判据
-  $notMaxed = -not $isMax
-
-  # 前台感知:仅 DS_FG_MODE=1 时读取前台进程名(隐私门控);默认只输出全屏标志
-  $suffix = ""
-  if ($env:DS_FG_MODE -eq "1") {
-      $fwPid = 0
-      [WAPI]::GetWindowThreadProcessId($fw, [ref]$fwPid) | Out-Null
-      try {
-          $proc = Get-Process -Id $fwPid -ErrorAction Stop
-          $suffix = "|" + $proc.ProcessName
-      } catch {
-          $suffix = "|unknown"
-      }
-  }
-  # 判定链:铺满 → 无标题栏 → 非外壳窗口 → (高度超过工作区 或 非最大化)
-  $isFullscreen = $false
-  if ($full -and -not $hasCaption -and -not $isShell) {
-      if ($beatsWorkArea) { $isFullscreen = $true }
-      elseif ($notMaxed) { $isFullscreen = $true }
-  }
-  if ($isFullscreen) { Write-Output ("FULLSCREEN" + $suffix) } else { Write-Output ("WINDOWED" + $suffix) }
-`;
-  // 精简环境变量:环境块过大(>64KB)会导致 Add-Type 编译失败,检测永久失效(实测 368KB 环境必挂)
-  const MINIMAL_ENV = {
-    PATH: process.env.PATH || '',
-    SystemRoot: process.env.SystemRoot || 'C:\\Windows',
-    COMSPEC: process.env.COMSPEC || 'C:\\Windows\\System32\\cmd.exe',
-    TEMP: process.env.TEMP || 'C:\\Windows\\Temp',
-    TMP: process.env.TMP || 'C:\\Windows\\Temp',
-    USERPROFILE: process.env.USERPROFILE || '',
-  };
   const FS_CHECK_INTERVAL = { fullscreen: 800, windowed: 3000 }; // 全屏时高频,平时低频
   // 去抖/迟滞:进入全屏要连续 ENTER 次命中才隐藏(躲开切换动画、最大化→全屏的中间态),
   // 退出全屏只要 1 次未命中就恢复(宁可早一点让桌宠回来,也别让它多藏一会儿)
@@ -1148,41 +1041,38 @@ app.whenReady().then(() => {
     if (fsCheckTimer) clearTimeout(fsCheckTimer);
     fsCheckTimer = setTimeout(runFsCheck, delay);
   }
-  // 探测后端契约:probe(cb) → cb(err, { fullscreen, processName })
-  //   Windows:powershell 跑内嵌 FS_CHECK_SCRIPT(解析 "FULLSCREEN|chrome")
-  //   Linux  :xprop/xwininfo(modules/x11-foreground.js);探测不可用时**正常返回非全屏**,
-  //            绝不以 err 形式把整条检测链打断(否则 wasFullscreen 卡 true,桌宠永久消失)
-  function probeWindows(cb) {
-    execFile(
-      'powershell',
-      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', FS_CHECK_SCRIPT],
-      // DS_FG_MODE 门控:开关关闭时不采集任何前台信息
-      { timeout: 4000, windowsHide: true, env: { ...MINIMAL_ENV, DS_FG_MODE: mode.getForegroundAware() ? '1' : '0' } },
-      (err, stdout) => {
-        if (err) return cb(err);
-        const [flag, proc] = String(stdout || '').split('|');
-        cb(null, { fullscreen: flag === 'FULLSCREEN', processName: proc || null });
-      },
-    );
-  }
-
-  function probeLinux(cb) {
+  // 探测后端契约:probe(wantProc, cb) → cb(null, { fullscreen, processName, reason })
+  // 两个平台实现同一契约,外部去抖/广播逻辑不必区分平台。
+  function probeWindows(wantProc, cb) {
     try {
-      // 惰性 require:非 Linux 平台不需要这条链路,也让 require-check 的 stub 环境更干净
-      if (!x11Foreground) x11Foreground = require('./modules/x11-foreground').create({ log });
-      x11Foreground.probe(mode.getForegroundAware(), (err, res) => cb(err, res));
+      // 惰性 require:koffi 是原生模块,只在 Windows 上加载
+      if (!win32Foreground) win32Foreground = require('./modules/win32-foreground').create({ log });
+      win32Foreground.probe(wantProc, cb);
     } catch (e) {
-      // 模块缺失/加载失败:降级为"非全屏",下一轮继续(不抛错、不终止轮询)
-      cb(null, { fullscreen: false, processName: null });
+      // 模块缺失(koffi 未随包分发)或加载失败:降级为"非全屏",下一轮继续
+      log('[fullscreen] win32 后端不可用:', e && e.message);
+      cb(null, { fullscreen: false, processName: null, reason: 'module-missing' });
     }
   }
 
+  function probeLinux(wantProc, cb) {
+    try {
+      // 惰性 require:非 Linux 平台不需要这条链路,也让 require-check 的 stub 环境更干净
+      if (!x11Foreground) x11Foreground = require('./modules/x11-foreground').create({ log });
+      x11Foreground.probe(wantProc, cb);
+    } catch (e) {
+      // 模块缺失/加载失败:降级为"非全屏",下一轮继续(不抛错、不终止轮询)
+      cb(null, { fullscreen: false, processName: null, reason: 'module-missing' });
+    }
+  }
+
+  // 探测后端按平台分派(wantProc 在调用点传入,由前台感知开关决定)
   const fsProbe = process.platform === 'win32' ? probeWindows : probeLinux;
 
   function runFsCheck() {
     if (fsCheckRunning) return; // 上次还没完成就跳过
     fsCheckRunning = true;
-    fsProbe((err, res) => {
+    fsProbe(mode.getForegroundAware(), (err, res) => {
       fsCheckRunning = false;
       try {
         if (err) {
@@ -1222,8 +1112,8 @@ app.whenReady().then(() => {
 
   // 前台感知开关联动:只影响"前台上下文动画"(是否采集前台进程名),**不影响全屏隐藏**。
   // 两件事原本共用一个开关,关掉感知就等于连全屏隐藏一起关掉 —— 那是把隐私开关和
-  // 体验开关错误耦合。现在:轮询照常跑(全屏检测要继续工作),仅 DS_FG_MODE 位随之变化,
-  // 读不读前台进程名由脚本那一侧决定(隐私门控仍在脚本里,关闭时确实不读任何前台信息)。
+  // 体验开关错误耦合。现在:轮询照常跑(全屏检测要继续工作),只有 wantProc 位随之变化,
+  // 读不读前台进程名由探测后端决定(隐私门控在后端内,关闭时确实不读任何前台进程名)。
   fgToggleHandler = () => {
     // 关闭感知:清掉已广播的上下文,让桌宠回到纯随机动作链(不停轮询,全屏检测仍需运行)
     if (!mode.getForegroundAware()) {
@@ -1237,7 +1127,7 @@ app.whenReady().then(() => {
     if (!fsCheckTimer) scheduleFsCheck(300); // 开关状态立即生效,不必等下一轮
   };
 
-  // 启动即开始轮询:全屏隐藏是独立功能,不依赖前台感知开关(隐私门控在脚本内按 DS_FG_MODE 走)
+  // 启动即开始轮询:全屏隐藏是独立功能,不依赖前台感知开关(隐私门控在后端按 wantProc 走)
   scheduleFsCheck(2000); // 启动 2 秒后首查
 });
 

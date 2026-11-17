@@ -1,6 +1,6 @@
 {
   "name": "deepseek-desktop",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "main": "main.js",
   "desktopName": "deepseek-desktop.desktop",
   "scripts": {
@@ -39,7 +39,13 @@
       "main.js",
       "modules/**/*",
       "ui/**/*",
-      "!ui/**/*.bak"
+      "!ui/**/*.bak",
+      "node_modules/koffi/**/*",
+      "node_modules/@koromix/**/*"
+    ],
+    "asarUnpack": [
+      "node_modules/koffi/**/*",
+      "node_modules/@koromix/**/*"
     ],
     "win": {
       "target": "nsis",
@@ -99,6 +105,7 @@
     }
   },
   "dependencies": {
-    "electron-updater": "^6.8.9"
+    "electron-updater": "^6.8.9",
+    "koffi": "^3.3.8"
   }
 }

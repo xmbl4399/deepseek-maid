@@ -171,15 +171,23 @@ npx electron-builder --linux --publish never   # 输出 release/*.deb 与 *.AppI
 
 | 能力 | Windows | Ubuntu |
 | --- | --- | --- |
-| 全屏检测（决定桌宠是否避让） | `user32.dll`，进程名精确 | `xprop` + `xwininfo`（同属 `x11-utils`）读 EWMH 状态；**Wayland 原生会话下测不到**，会退化为不检测（桌宠不避让，但不影响其他功能） |
+| 全屏检测（决定桌宠是否避让） | 进程内 P/Invoke `user32.dll`（经 `koffi`，**不启动 PowerShell/子进程**），进程名精确 | `xprop` + `xwininfo`（同属 `x11-utils`）读 EWMH 状态；**Wayland 原生会话下测不到**，会退化为不检测（桌宠不避让，但不影响其他功能） |
 | 开机启动 | 注册表 Run 项 | `~/.config/autostart/deepseek-desktop.desktop`（XDG 标准）；AppImage 场景自动指向 `$APPIMAGE` 本体，避免挂载点变化导致失效 |
 | 卸载 | 调用 NSIS 卸载器 | 无 NSIS，改为弹窗给出 `sudo apt remove deepseek-desktop` 并复制到剪贴板 |
 | 托盘气泡提示 | `displayBalloon` | 系统 `Notification`；GNOME 默认不显示托盘图标，此时只能靠快捷键/主窗口操作，**不会崩溃** |
 | 窗口透明（桌宠/悬浮球） | 原生支持 | 需要合成器；X11 下正常，纯 Wayland 下可能不透明或位置偏移 |
 | 自动更新 | `electron-updater` + NSIS | 仅 AppImage 支持（需 `$APPIMAGE`）；deb 装的版本请用 `apt upgrade` |
 
-**为什么 Linux 上没有 `check-fullscreen.ps1` 的对应脚本文件？**
-Windows 那份 PowerShell 脚本是内嵌在 `main.js` 里的（便于单文件分发，且有测试逐行校验它与 `check-fullscreen.ps1` 同步）。Linux 侧逻辑较多（解析 xprop/xwininfo 输出、多显示器判定、降级），放进独立模块 `modules/x11-foreground.js` 更好维护，也便于用纯函数单测覆盖 —— 这类逻辑一旦出错，表现是"桌宠该收起时不收起 / 永久消失"，只能靠单测兜住。
+**全屏检测为什么不用 PowerShell？**
+v1.2.2 之前，Windows 侧用一个内嵌的 PowerShell 脚本（`Add-Type` 现场编译 C# 再 P/Invoke）做全屏探测。它功能上是对的，但有三个实际问题：
+
+1. **会被杀毒软件拦** —— 每 3 秒拉起一次 `powershell.exe -ExecutionPolicy Bypass` 并内嵌 C# 源码，行为特征与"利用 PowerShell 执行可疑脚本"高度重合，实测火绒会稳定拦截；
+2. **开销大** —— 进程冷启动约 1 秒，而轮询间隔只有 3 秒，等于长期占着一份 CPU 空转；
+3. **脆弱** —— `Add-Type` 受环境块大小影响，环境变量超过 64KB 时编译失败、检测永久失效。
+
+现在改为进程内通过 `koffi`（Node-API 稳定 ABI，无需随 Electron 重编译）直接 P/Invoke `user32.dll` / `kernel32.dll`：**零子进程、零临时文件、零代码生成**，单次探测从约 1000ms 降到 **0.09ms**。判据与原来逐条一致（铺满屏幕 + 无标题栏 + 非外壳窗口 + 高度超过工作区），逻辑集中在 `modules/win32-foreground.js`，与 Linux 侧的 `modules/x11-foreground.js` 共用同一套 `probe(wantProc, cb)` 契约，可用纯函数单测覆盖。
+
+> 注意：该模块必须在 **Electron 主进程**中调用。主进程默认 DPI-aware，`GetWindowRect` / `GetMonitorInfoW` 返回物理像素；若在非 DPI-aware 进程中调用，判据会因坐标被虚拟化而系统性失灵（窗口永远"铺不满"屏幕）。原生模块在打包时需经 `asarUnpack` 解包（见 `package.json`），asar 内的 `.node` 无法加载。
 
 ---
 
@@ -188,7 +196,7 @@ Windows 那份 PowerShell 脚本是内嵌在 `main.js` 里的（便于单文件�
 - **不收集任何数据** —— 没有埋点、没有统计上报、没有崩溃回传
 - **只访问两处网络** —— ① `chat.deepseek.com`（对话内容，由官方网页直连）；② GitHub Releases（检查 / 下载更新）。除此之外没有任何自建服务或中转
 - **菜单里的「搜索」** —— 用系统默认浏览器打开 Bing，不在应用内发起请求
-- **前台感知**（可关闭）—— 只读取**当前前台窗口的进程名与全屏状态**，用于决定动画类型和是否避让，不记录、不上传；托盘「前台感知开关」可关闭
+- **前台感知**（可关闭）—— 只读取**当前前台窗口的进程名、窗口类名、位置尺寸与全屏状态**，用于决定动画类型和是否避让，不记录、不上传。托盘「前台感知开关」关闭后**不再读取前台进程名**（仍会读窗口类名/尺寸以判断是否全屏，否则全屏自动避让会失效）
 
 ---
 
