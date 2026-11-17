@@ -468,16 +468,10 @@ function hideMain() {
   if (state.mainWindow && !state.mainWindow.isDestroyed()) state.mainWindow.hide();
 }
 
-// 卸载 DeepSeek:Windows 走 NSIS 卸载器;Linux 走包管理器
+// 卸载 DeepSeek:定位 NSIS 卸载程序,二次确认后运行(仅打包版有意义)
 function uninstallApp() {
   if (!app.isPackaged) {
     dialog.showMessageBox({ type: 'info', message: '开发模式下不支持卸载' }).catch(() => {});
-    return;
-  }
-  // Linux 没有可执行的自卸载器:deb 归 dpkg/apt 管,AppImage 直接删文件。
-  // 这里给出**对应安装方式的具体命令**,而不是假装能自卸载。
-  if (process.platform === 'linux') {
-    uninstallLinux();
     return;
   }
   const exeDir = path.dirname(process.execPath);
@@ -515,50 +509,6 @@ function uninstallApp() {
     .catch(() => {});
 }
 
-// Linux 卸载引导:按实际安装形态给命令(不伪造"一键卸载"按钮 —— 那需要 root,弹 sudo 更糟)
-function uninstallLinux() {
-  const isAppImage = !!(process.env.APPIMAGE && process.env.APPIMAGE.length);
-  const fs = require('fs');
-  const pkgName = 'deepseek-desktop';
-  const dataDir = app.getPath('userData');
-  // deb 装过 /opt 下才会有 Uninstall 之外的目录;用它判断"是 deb 还是 AppImage"
-  const debInstalled = fs.existsSync('/opt/DeepSeek Desktop');
-  const lines = [];
-  if (isAppImage && !debInstalled) {
-    lines.push('本应用以 AppImage 形式运行,直接删除该文件即可完成"卸载"。');
-    lines.push('');
-    lines.push(`AppImage: ${process.env.APPIMAGE}`);
-    lines.push('');
-    lines.push('如需一并清除配置与登录态:');
-    lines.push(`  rm -rf "${dataDir}"`);
-  } else {
-    lines.push('本应用由系统包管理器安装,请用 apt 卸载:');
-    lines.push('');
-    lines.push(`  sudo apt remove ${pkgName}`);
-    lines.push('');
-    lines.push('如需一并删除配置与登录态:');
-    lines.push(`  rm -rf "${dataDir}"`);
-    lines.push('');
-    lines.push('(也可在"软件"或"应用中心"里搜索 DeepSeek 卸载)');
-  }
-  dialog
-    .showMessageBox({
-      type: 'info',
-      title: '卸载 DeepSeek',
-      message: 'Linux 上请使用系统包管理器卸载',
-      detail: lines.join('\n'),
-      buttons: ['复制命令', '关闭'],
-      defaultId: 0,
-      cancelId: 1,
-    })
-    .then(({ response }) => {
-      if (response !== 0) return;
-      const cmd = isAppImage && !debInstalled ? `rm -f "${process.env.APPIMAGE}"` : `sudo apt remove ${pkgName}`;
-      clipboard.writeText(cmd);
-      shellToast('卸载命令已复制到剪贴板');
-    })
-    .catch(() => {});
-}
 
 // ---------------- 菜单上下文(托盘 + 悬浮球菜单共用的渲染依据) ----------------
 // 只描述"当前是什么状态",不决定"有哪些项" —— 项序/分组在 modules/menu-model.js。
@@ -566,16 +516,7 @@ function uninstallLinux() {
 
 // 读取开机启动状态。⚠️ 不能传 name:Windows 下 get 的 openAtLogin 固定读 AppUserModelId 值名,
 // 传 name 会被忽略 ⇒ 永远读回 false(1.1.4 托盘勾选"勾不上"的根源,详见文件头常量注释)。
-// Linux:Electron 的 set/getLoginItemSettings 在该平台是空实现(不报错、也不生效),
-// 必须走 XDG autostart .desktop(modules/autostart.js),否则勾选框会永远不亮。
 function isAutoStartOn() {
-  if (process.platform === 'linux') {
-    try {
-      return require('./modules/autostart').isEnabled();
-    } catch (e) {
-      return false;
-    }
-  }
   try {
     return !!app.getLoginItemSettings({ path: process.execPath }).openAtLogin;
   } catch (e) {
@@ -583,17 +524,8 @@ function isAutoStartOn() {
   }
 }
 
-// 写入开机启动状态(与 isAutoStartOn 同一口径分平台)
+// 写入开机启动状态
 function setAutoStartOn(next) {
-  if (process.platform === 'linux') {
-    try {
-      const a = require('./modules/autostart').create({ log });
-      return a.set(!!next);
-    } catch (e) {
-      log('[settings] autostart 写入失败:', e.message);
-      return false;
-    }
-  }
   // 只传 path,不传 name —— 值名走 AppUserModelId,与 get 的读取口径保持一致(详见文件头常量注释)
   app.setLoginItemSettings({ openAtLogin: !!next, path: process.execPath });
   return true;
@@ -773,8 +705,7 @@ function onUiAction(name, payload) {
     }
     case 'toggle-autostart': {
       const next = payload && typeof payload.checked === 'boolean' ? payload.checked : !isAutoStartOn();
-      // 分平台口径:Windows 走 setLoginItemSettings(值名走 AppUserModelId,不传 name),
-      // Linux 走 XDG autostart .desktop —— Electron 在 Linux 上该 API 是空实现
+      // 值名走 AppUserModelId,不传 name(与 isAutoStartOn 的读取口径一致)
       setAutoStartOn(next);
       log('[settings] autoStart =', next, '-> now:', isAutoStartOn());
       tray.refresh();
@@ -967,7 +898,7 @@ app.whenReady().then(() => {
   setupAppMenu();
   // 开机启动默认开:仅首次启动(打包版)自动设置,记录标记后不再干预(用户可托盘关闭)
   if (app.isPackaged && !mode.isAutoStartInit()) {
-    // Linux 写 ~/.config/autostart/*.desktop,Windows 写注册表 Run 键(见 setAutoStartOn)
+    // 写注册表 Run 键(见 setAutoStartOn)
     setAutoStartOn(true);
     mode.markAutoStartInit();
   }
@@ -1013,13 +944,11 @@ app.whenReady().then(() => {
   let fsCheckTimer = null;
   // 平台探测后端(惰性创建,契约统一):
   //   Windows → modules/win32-foreground.js(进程内 koffi P/Invoke,零子进程零临时文件)
-  //   Linux   → modules/x11-foreground.js(xprop/xwininfo)
   // 两者都是 probe(wantProc, cb) → cb(null, { fullscreen, processName, reason });
   // wantProc=false 时不读取前台进程名(隐私默认),但全屏判定照常进行。
   // 探测不可用时**正常返回非全屏**,绝不以 err 打断检测链 —— 否则 wasFullscreen
   // 会卡在 true,悬浮球/鲸鱼娘将永久隐藏且无法恢复。
   let win32Foreground = null;
-  let x11Foreground = null;
   const FS_CHECK_INTERVAL = { fullscreen: 800, windowed: 3000 }; // 全屏时高频,平时低频
   // 去抖/迟滞:进入全屏要连续 ENTER 次命中才隐藏(躲开切换动画、最大化→全屏的中间态),
   // 退出全屏只要 1 次未命中就恢复(宁可早一点让桌宠回来,也别让它多藏一会儿)
@@ -1042,7 +971,6 @@ app.whenReady().then(() => {
     fsCheckTimer = setTimeout(runFsCheck, delay);
   }
   // 探测后端契约:probe(wantProc, cb) → cb(null, { fullscreen, processName, reason })
-  // 两个平台实现同一契约,外部去抖/广播逻辑不必区分平台。
   function probeWindows(wantProc, cb) {
     try {
       // 惰性 require:koffi 是原生模块,只在 Windows 上加载
@@ -1055,19 +983,8 @@ app.whenReady().then(() => {
     }
   }
 
-  function probeLinux(wantProc, cb) {
-    try {
-      // 惰性 require:非 Linux 平台不需要这条链路,也让 require-check 的 stub 环境更干净
-      if (!x11Foreground) x11Foreground = require('./modules/x11-foreground').create({ log });
-      x11Foreground.probe(wantProc, cb);
-    } catch (e) {
-      // 模块缺失/加载失败:降级为"非全屏",下一轮继续(不抛错、不终止轮询)
-      cb(null, { fullscreen: false, processName: null, reason: 'module-missing' });
-    }
-  }
-
-  // 探测后端按平台分派(wantProc 在调用点传入,由前台感知开关决定)
-  const fsProbe = process.platform === 'win32' ? probeWindows : probeLinux;
+  // 探测后端(wantProc 在调用点传入,由前台感知开关决定)
+  const fsProbe = probeWindows;
 
   function runFsCheck() {
     if (fsCheckRunning) return; // 上次还没完成就跳过

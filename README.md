@@ -33,18 +33,7 @@
 
 > 安装包文件名仍是 `DeepSeek-Desktop-Setup`，原因见 [常见问题](#常见问题)。
 
-**Ubuntu / Debian 系**：同一个 Release 里另有 `.deb` 与 `.AppImage` 两种产物。
-
-```bash
-# 方式一:deb(推荐,进系统菜单、可用 apt 卸载、开机启动走标准 XDG 机制)
-sudo apt install ./DeepSeek-Desktop-<版本>-amd64.deb
-
-# 方式二:AppImage(免安装,拷到哪都能跑)
-chmod +x DeepSeek-Desktop-<版本>-x86_64.AppImage
-./DeepSeek-Desktop-<版本>-x86_64.AppImage
-```
-
-卸载：deb 用 `sudo apt remove deepseek-desktop`，AppImage 直接删文件。应用内「卸载」菜单在 Linux 上会给出对应命令并复制到剪贴板（Linux 没有 NSIS 卸载器，只能交给包管理器）。
+> v1.2.2 起本项目**只发布 Windows 版**。Linux（deb/AppImage）与 macOS 目标已移除。
 
 ### 从源码构建
 
@@ -62,15 +51,10 @@ npm run build    # 打包 Windows 安装包，输出到 release/
 > 把构建输出指到项目外目录再试：
 > `npx electron-builder --win --publish never --config.directories.output=%TEMP%\dsbuild`
 
-**构建 Ubuntu 安装包**必须在 Linux 上做（`deb` 依赖 `fpm`，`AppImage` 依赖 `mksquashfs`，两者都是 Linux 可执行文件，无法在 Windows/macOS 上交叉产出）：
+**构建 Windows 安装包**：在 Windows 上执行 `npm run build`（即 `electron-builder --win`），产物在 `release/`。
 
-```bash
-sudo apt install -y fakeroot dpkg xz-utils
-npx electron-builder --linux --publish never   # 输出 release/*.deb 与 *.AppImage
-```
-
-仓库已配好 CI：`.github/workflows/build.yml` 的 `build-linux` job 在 `ubuntu-latest` 上自动完成上述步骤，
-打 `v*` tag 时随 Release 一起发布，手动触发（Actions → Run workflow）则上传为 artifact 供下载。
+仓库已配好 CI：`.github/workflows/build.yml` 的 `build-win` job 在 `windows-latest` 上跑测试与 lint 后自动构建，
+打 `v*` tag 时随 Release 一起发布。
 
 ---
 
@@ -166,17 +150,8 @@ npx electron-builder --linux --publish never   # 输出 release/*.deb 与 *.AppI
 **触屏上长按文字总是直接弹菜单？**
 是设计上的「两段式」：第一次长按只框选文字，确认选区后再长按才弹菜单 —— 想换一段文字时不会被菜单打断。
 
-**Ubuntu 上有哪些功能会降级？**
-主干功能（多标签、登录态、框选截图提问、悬浮球/鲸鱼女仆、托盘菜单、快捷键）与 Windows 一致。以下依赖 Windows 专有能力，Linux 上换成了等价实现，个别场景会有差异：
-
-| 能力 | Windows | Ubuntu |
-| --- | --- | --- |
-| 全屏检测（决定桌宠是否避让） | 进程内 P/Invoke `user32.dll`（经 `koffi`，**不启动 PowerShell/子进程**），进程名精确 | `xprop` + `xwininfo`（同属 `x11-utils`）读 EWMH 状态；**Wayland 原生会话下测不到**，会退化为不检测（桌宠不避让，但不影响其他功能） |
-| 开机启动 | 注册表 Run 项 | `~/.config/autostart/deepseek-desktop.desktop`（XDG 标准）；AppImage 场景自动指向 `$APPIMAGE` 本体，避免挂载点变化导致失效 |
-| 卸载 | 调用 NSIS 卸载器 | 无 NSIS，改为弹窗给出 `sudo apt remove deepseek-desktop` 并复制到剪贴板 |
-| 托盘气泡提示 | `displayBalloon` | 系统 `Notification`；GNOME 默认不显示托盘图标，此时只能靠快捷键/主窗口操作，**不会崩溃** |
-| 窗口透明（桌宠/悬浮球） | 原生支持 | 需要合成器；X11 下正常，纯 Wayland 下可能不透明或位置偏移 |
-| 自动更新 | `electron-updater` + NSIS | 仅 AppImage 支持（需 `$APPIMAGE`）；deb 装的版本请用 `apt upgrade` |
+**支持 Linux 吗？**
+v1.2.2 起不再提供。此前版本曾带 `.deb` / `.AppImage` 产物，但 Linux 侧需要为每个平台单独维护一套能力（X11 全屏探测、XDG 开机自启、包管理器卸载引导），维护成本高于实际收益，因此移除了 Linux/macOS 目标，只保留 Windows。源码是 MIT 的，需要的话可以自行 fork 加回。
 
 **全屏检测为什么不用 PowerShell？**
 v1.2.2 之前，Windows 侧用一个内嵌的 PowerShell 脚本（`Add-Type` 现场编译 C# 再 P/Invoke）做全屏探测。它功能上是对的，但有三个实际问题：
@@ -185,7 +160,7 @@ v1.2.2 之前，Windows 侧用一个内嵌的 PowerShell 脚本（`Add-Type` 现
 2. **开销大** —— 进程冷启动约 1 秒，而轮询间隔只有 3 秒，等于长期占着一份 CPU 空转；
 3. **脆弱** —— `Add-Type` 受环境块大小影响，环境变量超过 64KB 时编译失败、检测永久失效。
 
-现在改为进程内通过 `koffi`（Node-API 稳定 ABI，无需随 Electron 重编译）直接 P/Invoke `user32.dll` / `kernel32.dll`：**零子进程、零临时文件、零代码生成**，单次探测从约 1000ms 降到 **0.09ms**。判据与原来逐条一致（铺满屏幕 + 无标题栏 + 非外壳窗口 + 高度超过工作区），逻辑集中在 `modules/win32-foreground.js`，与 Linux 侧的 `modules/x11-foreground.js` 共用同一套 `probe(wantProc, cb)` 契约，可用纯函数单测覆盖。
+现在改为进程内通过 `koffi`（Node-API 稳定 ABI，无需随 Electron 重编译）直接 P/Invoke `user32.dll` / `kernel32.dll`：**零子进程、零临时文件、零代码生成**，单次探测从约 1000ms 降到 **0.09ms**。判据与原来逐条一致（铺满屏幕 + 无标题栏 + 非外壳窗口 + 高度超过工作区），逻辑集中在 `modules/win32-foreground.js`，判据是纯函数，可用单测覆盖。
 
 > 注意：该模块必须在 **Electron 主进程**中调用。主进程默认 DPI-aware，`GetWindowRect` / `GetMonitorInfoW` 返回物理像素；若在非 DPI-aware 进程中调用，判据会因坐标被虚拟化而系统性失灵（窗口永远"铺不满"屏幕）。原生模块在打包时需经 `asarUnpack` 解包（见 `package.json`），asar 内的 `.node` 无法加载。
 

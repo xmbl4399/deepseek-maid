@@ -56,9 +56,7 @@ const REQUIRED_FILES = [
   'modules/context-menu.js',
   'modules/menu-model.js',
   'modules/topmost.js',
-  'modules/x11-foreground.js',
   'modules/win32-foreground.js',
-  'modules/autostart.js',
 ];
 
 test('关键文件存在', () => {
@@ -218,9 +216,7 @@ test('JS 语法检查(node --check)', () => {
     'modules/context-menu.js',
     'modules/menu-model.js',
     'modules/topmost.js',
-    'modules/x11-foreground.js',
     'modules/win32-foreground.js',
-    'modules/autostart.js',
   ];
   for (const f of jsFiles) {
     execFileSync(NODE, ['--check', path.join(ROOT, f)], { stdio: 'pipe' });
@@ -687,105 +683,43 @@ test('鲸鱼娘默认位置:右缘贴边 + 人物中心落在下三分之一(与
   assert.ok(pet.includes('hitCenterY'), '应按人物命中区中心定位,否则人物会偏上');
 });
 
-test('Linux 打包配置(deb + AppImage)完整', () => {
-  const pkg = JSON.parse(read('package.json'));
-  const linux = pkg.build.linux;
-  // 两种产物:deb 走系统包管理器(可 `apt remove`),AppImage 免安装便携。
-  // 只出 AppImage 会让"卸载/开机启动/桌面图标"走不通,只出 deb 则无法免安装试用。
-  assert.deepStrictEqual(linux.target, ['deb', 'AppImage'], 'Linux 目标应为 deb + AppImage');
-  // 图标必须是按尺寸命名的目录(build/icons/32x32.png …),electron-builder 靠文件名推尺寸;
-  // 直接给单个 png 只会生成一张不缩放的图标,任务栏/菜单会糊
-  assert.strictEqual(linux.icon, 'build/icons');
-  for (const s of [16, 24, 32, 48, 64, 128, 256, 512]) {
-    const p = path.join(ROOT, `build/icons/${s}x${s}.png`);
-    assert.ok(fs.existsSync(p), `缺少图标 build/icons/${s}x${s}.png`);
-    assert.ok(fs.statSync(p).size > 0, `图标为空: ${s}x${s}.png`);
-  }
-  // 可执行文件名 = .desktop 的 Icon 键值,保持稳定;与产品显示名 "DeepSeek" 解耦
-  assert.strictEqual(linux.executableName, 'deepseek-desktop');
-  // freedesktop 分类(菜单里归到"网络"),缺了会被归入 "Other"
-  assert.ok(linux.category, '缺少 linux.category');
-  assert.ok(linux.desktop && linux.desktop.entry, '缺少 desktop entry 覆盖项');
-  assert.strictEqual(linux.desktop.entry.Name, 'DeepSeek', '桌面显示名应为 DeepSeek');
-  assert.ok(linux.desktop.entry.Categories.includes('Network'), 'Categories 应含 Network');
-  // deb 元数据:没有 maintainer 时 electron-builder 会报警并写入 example.com
-  assert.ok(/<.+@.+>/.test(linux.maintainer), 'deb 需要合法的 maintainer(名 <邮箱>)');
-  assert.ok(pkg.build.deb && pkg.build.deb.packageName, '缺少 deb 包名');
-  assert.strictEqual(pkg.build.deb.packageName, 'deepseek-desktop');
-  // desktopName + syncDesktopName:让 Electron 的 app_id 与 .desktop 文件名、StartupWMClass 一致,
-  // 否则任务栏会出现"两个图标"或窗口归不到菜单项上(electron-builder 会在缺省时直接告警)
-  assert.ok(pkg.desktopName, '缺少 desktopName(app_id 与 .desktop 关联)');
-  assert.strictEqual(pkg.desktopName, 'deepseek-desktop.desktop');
-  assert.strictEqual(linux.syncDesktopName, true, '应开启 syncDesktopName');
-  // 产物名带版本与架构,便于同一 release 下区分 x64/arm64
-  assert.ok(String(linux.artifactName).includes('${version}'), 'artifactName 应含版本号');
-  assert.ok(String(linux.artifactName).includes('${arch}'), 'artifactName 应含架构');
-});
-
-test('Linux 平台分支:全屏探测 / 开机自启 / 卸载 / 托盘 均已适配', () => {
+test('仅面向 Windows:无 Linux/macOS 平台分支残留', () => {
   const main = read('main.js');
-  const x11 = read('modules/x11-foreground.js');
-  const autostart = read('modules/autostart.js');
-  const tray = read('modules/tray.js');
+  const pkg = JSON.parse(read('package.json'));
 
-  // ---- 1) 全屏探测:Windows 走 powershell,Linux 走 xprop/xwininfo ----
-  // 探测后端必须按平台分派,不能无条件 execFile('powershell')
-  assert.ok(main.includes("process.platform === 'win32' ? probeWindows : probeLinux"), '缺少全屏探测平台分派');
-  assert.ok(main.includes('function probeWindows('), '缺少 Windows 探测后端');
-  assert.ok(main.includes('function probeLinux('), '缺少 Linux 探测后端');
-  assert.ok(main.includes("require('./modules/x11-foreground')"), 'Linux 探测应复用 x11-foreground 模块');
-  // 两个后端必须同契约 (wantProc, cb) → cb(null, {fullscreen, processName})，
-  // 否则外层去抖逻辑会读到 undefined
-  assert.ok(main.includes("require('./modules/win32-foreground')"), 'Windows 探测应复用 win32-foreground 模块');
-  assert.ok(/probe\(wantProc, cb\)/.test(main), 'Windows 后端应按 wantProc 契约转发');
-  // 内嵌 PowerShell 脚本已删除(改由原生探测取代),不应再出现
+  // v1.2.2 起本项目只发 Windows 版:Linux(deb/AppImage)与 macOS 目标已移除。
+  // 这条测试守两件事:① 打包配置里不再出现 linux/deb/mac 目标;
+  // ② 代码里不再有平台分叉 —— 否则会出现"配置已删但代码还在调 xprop"这类半吊子状态。
+  assert.ok(!pkg.build.linux, 'build.linux 应已移除(不再发 Linux 包)');
+  assert.ok(!pkg.build.deb, 'build.deb 应已移除');
+  assert.ok(!pkg.build.mac, 'build.mac 应已移除');
+  assert.ok(!pkg.build.appImage, 'build.appImage 应已移除');
+  assert.ok(!pkg.desktopName, 'desktopName 只服务 Linux .desktop,应已移除');
+  assert.strictEqual(pkg.build.win.target, 'nsis', 'Windows 目标应为 nsis');
+  assert.strictEqual(pkg.build.win.icon, 'build/icon.ico');
 
-  // ---- x11-foreground:纯解析函数必须存在且不依赖 shell ----
-  for (const fn of ['parseActiveWindow', 'parseProps', 'parseGeometry', 'coversDisplay', 'judge']) {
-    assert.ok(x11.includes(`function ${fn}(`), `x11-foreground 缺少 ${fn}`);
+  // Linux 专属模块已删除
+  assert.ok(!fs.existsSync(path.join(ROOT, 'modules', 'x11-foreground.js')), 'x11-foreground.js 应已删除');
+  assert.ok(!fs.existsSync(path.join(ROOT, 'modules', 'autostart.js')), 'autostart.js 应已删除(仅 Linux 需要)');
+
+  // 代码里不应再有任何 Linux 平台分叉或 Linux 专属逻辑
+  for (const banned of ['x11-foreground', 'probeLinux', 'uninstallLinux', "require('./modules/autostart')"]) {
+    assert.ok(!main.includes(banned), `main.js 不应再引用 ${banned}`);
   }
-  // 多显示器:必须遍历 getAllDisplays,而不是只看主屏(副屏全屏时也应收起桌宠)
-  assert.ok(x11.includes('getAllDisplays'), '应遍历所有显示器');
-  // 测量窗口几何用的是 xwininfo,EWMH 状态用 xprop
-  assert.ok(x11.includes("'xprop'") && x11.includes("'xwininfo'"), '缺少 xprop/xwininfo 调用');
-  // 进程名从 /proc/<pid>/comm 读(不另外起 ps 进程,也不解析 ps 输出)
-  assert.ok(x11.includes('/proc') && x11.includes('comm'), '应从 /proc/<pid>/comm 读进程名');
-  // 关键降级:探测失败必须返回"非全屏",绝不能把 err 抛给调用方。
-  // 否则 main.js 的 wasFullscreen 会卡在 true,桌宠/悬浮球永久消失且无法恢复。
-  assert.ok(x11.includes('broken'), '缺少探测失败降级标记');
-  assert.ok(/done\(\{ fullscreen: false, processName: null \}\)/.test(x11), '失败时应回退为非全屏');
+  assert.ok(!/process\.platform === 'linux'/.test(main), 'main.js 不应再有 Linux 平台分支');
+  assert.ok(!main.includes('APPIMAGE'), 'main.js 不应再有 AppImage 逻辑');
+  assert.ok(!main.includes('apt remove'), 'main.js 不应再有 apt 卸载引导');
 
-  // ---- 2) 开机自启:Windows 注册表 / Linux XDG autostart ----
-  // Electron 在 Linux 上 set/getLoginItemSettings 是空实现(不报错也不生效),必须自己写 .desktop
-  assert.ok(autostart.includes('autostart'), '缺少 XDG autostart 目录');
-  assert.ok(autostart.includes('XDG_CONFIG_HOME'), '应尊重 XDG_CONFIG_HOME');
-  assert.ok(autostart.includes('[Desktop Entry]'), '缺少 .desktop 内容');
-  assert.ok(autostart.includes('X-GNOME-Autostart-enabled=true'), '缺少 GNOME 自启标记');
-  // AppImage 每次挂载点都不同,必须用 $APPIMAGE 的实际路径,写死 execPath 会导致开机启动失效
-  assert.ok(autostart.includes('process.env.APPIMAGE'), 'AppImage 场景应使用 $APPIMAGE 而非 execPath');
-  // Exec 路径含空格时必须加引号转义(freedesktop Exec 键规范)
-  assert.ok(autostart.includes('quoteExec'), '缺少 Exec 路径转义');
-  assert.ok(main.includes('function setAutoStartOn('), '缺少统一的自启写入入口');
-  assert.ok(main.includes("require('./modules/autostart').isEnabled()"), 'isAutoStartOn 应有 Linux 分支');
-  assert.ok(main.includes('setAutoStartOn(true)'), '首次启动默认自启应走统一入口');
+  // Windows 侧能力必须完好
+  assert.ok(main.includes('function probeWindows('), '缺少 Windows 全屏探测后端');
+  assert.ok(main.includes('function setAutoStartOn('), '缺少开机启动写入入口');
+  assert.ok(main.includes('function uninstallApp('), '缺少卸载流程');
+  assert.ok(main.includes("'Uninstall', 'DeepSeek Desktop.exe'"), 'Windows NSIS 卸载器路径被误改');
+  assert.ok(main.includes('setLoginItemSettings'), '缺少 Windows 注册表自启');
 
-  // ---- 3) 卸载:Windows 跑 NSIS / Linux 引导包管理器 ----
-  assert.ok(main.includes('function uninstallLinux('), '缺少 Linux 卸载引导');
-  assert.ok(main.includes('apt remove'), 'Linux 卸载应给出 apt remove 命令');
-  // Windows 分支必须原样保留(NSIS 卸载器路径是品牌断言的一部分)
-  assert.ok(main.includes("'Uninstall', 'DeepSeek Desktop.exe'"), 'Windows 卸载路径被误改');
-
-  // ---- 4) 托盘:Linux 无 displayBalloon,改走 Notification;托盘宿主缺失不能崩 ----
-  assert.ok(tray.includes('Notification'), 'Linux 通知应走 Notification');
-  assert.ok(tray.includes('isSupported()'), '应检查通知支持情况');
-  assert.ok(tray.includes('try {') && tray.includes('创建失败'), '托盘构造失败应被捕获');
-  // Linux 托盘图标 22px(StatusNotifierItem 按面板缩放),Windows 仍 16px
-  assert.ok(tray.includes("process.platform === 'win32' ? 16 : 22"), '托盘图标尺寸应分平台');
-
-  // ---- 5) 字体:Linux 无微软雅黑/苹方,必须带 CJK 兜底,否则中文显示为方框 ----
-  for (const f of ['ui/ui.css', 'ui/menu.html', 'ui/offline.html']) {
-    const css = read(f);
-    assert.ok(css.includes('Noto Sans CJK SC'), `${f} 缺少 Noto Sans CJK 兜底`);
-    assert.ok(css.includes('WenQuanYi Micro Hei'), `${f} 缺少文泉驿兜底`);
-  }
+  // CI 只保留 Windows 构建
+  const ci = read('.github/workflows/build.yml');
+  assert.ok(!ci.includes('build-linux'), 'CI 不应再有 build-linux job');
+  assert.ok(!ci.includes('--linux'), 'CI 不应再构建 Linux 产物');
+  assert.ok(ci.includes('build-win'), 'CI 应保留 build-win job');
 });

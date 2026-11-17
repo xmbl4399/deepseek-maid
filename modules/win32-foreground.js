@@ -61,7 +61,11 @@ function judge({ win, monitor, tolerance }) {
   const tol = typeof tolerance === 'number' ? tolerance : TOLERANCE;
   if (!win || !win.rect || !monitor) return { fullscreen: false, reason: 'no-window' };
 
+  // 类名是外壳窗口黑名单的唯一依据,取不到就无法排除 Progman/任务栏这类
+  // "铺满且无标题栏"的窗口 —— 此时必须保守判为非全屏(宁可桌宠不避让,
+  // 也不能因为把桌面当全屏而让桌宠永久消失)。
   const cls = String(win.className || '').toLowerCase();
+  if (!cls) return { fullscreen: false, reason: 'no-class-name' };
   if (SHELL_CLASSES.has(cls)) return { fullscreen: false, reason: 'shell-class' };
 
   // 1. 必须铺满屏幕
